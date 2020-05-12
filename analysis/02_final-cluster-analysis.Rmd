@@ -1,0 +1,1032 @@
+---
+title: "cluster-analysis"
+author: "Alena Stern"
+date: "05/09/2020"
+output: 
+  html_document:
+      code_folding: hide
+      toc: true
+      toc_depth: 3
+      toc_float:
+        collapsed: false
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(warning=FALSE, message=FALSE)
+
+# Note: Before knitting, make sure you"ve installed the packages used in the
+# sections below
+
+packages <- c("knitr", "tidyverse", "devtools", "psych", "cluster", "factoextra",
+              "gridExtra", "grid", "here", "rlang", "sf", "urbnthemes", "mclust",
+              "dbscan", "data.table", "R.utils")
+
+## INSTALL PACKAGES
+packages <- lapply(packages, FUN = function(x) {
+  if (!require(x, character.only = TRUE)) {
+    if (x == "urbnthemes") {
+      devtools::install_github("UrbanInstitute/urbnthemes")
+    } else {
+    install.packages(x)
+    }
+    library(x, character.only = TRUE)}})
+
+set_urbn_defaults(style = "print")
+
+```
+
+Source cluster analysis functions 
+```{r}
+# Define trial name for modeling run
+trial_name <- "final"
+
+source("cluster-functions.R")
+source("data_viz_functions.R")
+```
+
+# Read and Pre-Process Data
+
+Perform the following steps:
+
+1. Read in raw data
+2. Exclude reporting districts that are not LAPD Reporting Districts 
+  (excl_notLAPD_repdist = 1)
+3. Impute nulls with 0
+
+
+```{r cars}
+# read raw data
+data_raw <- read.csv(here("data", "analysis_ready_by_district_final.csv"),
+                     header = TRUE,
+                     sep = ",",
+                     fill = TRUE)
+exclusion <- read.csv(here("data", "Repdist_exclusions.csv"),
+                      header = TRUE,
+                      sep = ",",
+                      fill = TRUE)
+exclusion <- exclusion %>%
+  mutate(excl_notLAPD_repdist = replace_na(excl_notLAPD_repdist, 0))
+
+# remove observations to exclude - where not a LAPD reporting district
+data <- left_join(data_raw, exclusion, by = "repdist") %>%
+  filter(excl_notLAPD_repdist == 0)
+
+# impute nulls with 0
+data <- data %>%
+  replace(is.na(.), 0)
+
+```
+
+4. Calculate rate variables for calls for service (total, serious, non-serious), 
+  stops (vehicle, pedestrian), and crimes (part 1 violent, part 1 property, part 2) 
+  where denominator is total LA population
+5. Impute null rates with 0
+
+```{r}
+# calculate population over 18, total pop in LA, and pop proportion under 18
+data <- data %>% mutate(pop_over_age_18_count = total_pop - pop_under_age_18_count,
+                        #total_pop_LA = pop_under_age_18_count_LA + pop_over_age_18_count_LA,
+                        juv_pop_pct = pop_under_age_18_count/ total_pop)
+
+
+#data <- data %>% mutate(juv_pop_pct = pop_under_age_18_count/ total_pop)
+
+#calculate rate variables where denominator is total LA population
+for (col in c("cfs_ui", "s_numveh", "s_numped", "crime_p1v", "crime_p1p",
+              "crime_p2", "cfs_serious", "cfs_nonser")) {
+  rate_col_name <- paste(col, "_rate_LA", sep = "")
+  data <- data %>% mutate(!!rate_col_name := !!sym(col) / total_pop_LA)
+}
+
+# replace NA values in rates with 0
+data_analysis_vars <- data %>% replace(is.na(.), 0)
+```
+
+6. Define analysis columns
+
+```{r}
+# define columns to be used for clustering analysis
+analysis_cols <- c("stop_rate_b_LA.2018",
+                   "stop_rate_w_LA.2018",
+                   "stop_rate_a_LA.2018",
+                   "stop_rate_h_LA.2018",
+                   "cfs_serious_rate_LA.2018",
+                   "cfs_nonser_rate_LA.2018",
+                   "arr_rate_a_LA.2018",
+                   "arr_rate_b_LA.2018",
+                   "arr_rate_h_LA.2018",
+                   "arr_rate_w_LA.2018",
+                   "adult_arr_rate_LA.2018",
+                   "juv_arr_rate_LA.2018",
+                   "s_numveh_rate_LA.2018",
+                   "s_numped_rate_LA.2018",
+                   "crime_p1v_rate_LA.2018",
+                   "crime_p1p_rate_LA.2018",
+                   "crime_p2_rate_LA.2018")
+
+
+```
+
+7. Reshape data to be wide (each variable-year is a separate column) and select only 2018 columns for analysis
+
+```{r}
+# reshape data from long to wide
+data_2018_wide <- data_analysis_vars %>%
+  filter(year %in% c(2018, 2017)) %>%
+  reshape(timevar = "year", idvar = c("repdist"), direction = "wide")
+
+# drop 2017 columns
+data <- data_2018_wide %>% select(-contains("2017"))
+write.csv(data, here("data", paste(trial_name, "data_clean.csv", sep = "_")))
+
+
+```
+
+# Data Exploration
+
+For analysis columns, calculate min, max, and mean. We see that the mnimum value for all variables is 0, which means that there is a reporting district with no reported cases of each of the police-initiated and resident-initated contact types we include in our clustering. We also see that the average values are all quite low, given that we are using the the relevant LA-wide population as our denominator for calculating each of the rate variables. 
+
+```{r}
+data_num <- data %>% select(c(analysis_cols))
+repdist <- data$repdist
+sum_stats <- cbind(apply(data_num, 2, min),
+                   apply(data_num, 2, max),
+                   apply(data_num, 2, mean))
+sum_stats
+```
+
+Calculate LA-wide statistics
+
+```{r}
+s_rate_a <- sum(data$s_numall_a.2018) / sum(data$a_pop_count.2018)
+s_rate_b <- sum(data$s_numall_b.2018) / sum(data$b_pop_count.2018)
+s_rate_w <- sum(data$s_numall_w.2018) / sum(data$w_pop_count.2018)
+s_rate_h <- sum(data$s_numall_h.2018) / sum(data$h_pop_count.2018)
+
+arr_rate_a <- sum(data$arr_total_a.2018) / sum(data$a_pop_count.2018)
+arr_rate_b <- sum(data$arr_total_b.2018) / sum(data$b_pop_count.2018)
+arr_rate_w <- sum(data$arr_total_w.2018) / sum(data$w_pop_count.2018)
+arr_rate_h <- sum(data$arr_total_h.2018) / sum(data$h_pop_count.2018)
+
+pop_rate_a <- sum(data$a_pop_count.2018) / sum(data$total_pop.2018)
+pop_rate_b <- sum(data$b_pop_count.2018) / sum(data$total_pop.2018)
+pop_rate_w <- sum(data$w_pop_count.2018) / sum(data$total_pop.2018)
+pop_rate_h <- sum(data$h_pop_count.2018) / sum(data$total_pop.2018)
+
+avg_stop <- mean(data$s_totnum.2018)
+avg_arr <- mean(data$arr_total.2018)
+avg_cfs <- mean(data$cfs_ui.2018)
+avg_pop <- mean(data$total_pop.2018)
+avg_crime <- mean(data$crime_total.2018)
+
+race <- c("Asian", "Black", "White", "Hispanic")
+stop_rate <- c(s_rate_a, s_rate_b, s_rate_w, s_rate_h)
+arrest_rate <- c(arr_rate_a, arr_rate_b, arr_rate_w, arr_rate_h)
+population_rate <- c(pop_rate_a, pop_rate_b, pop_rate_w, pop_rate_h)
+
+summ_df <- data.frame(race, stop_rate, arrest_rate, population_rate)
+```
+
+# Cluster Analysis 
+
+## Model Selection
+
+```{r}
+var_corr <- var_corr_matrix(data_num, trial_name)
+
+#we upweight nonserious calls for service by a factor of 3 and serious by a
+#factor of 12 to make the number of police-initated variables and crime
+#variables roughly equivalent to the number of resident-initiated variables.
+#We give serious calls more weight due to their increased salience for both
+#residents and police
+
+weights <- weight_vars(data_num,
+                       var_corr,
+                       c("cfs_serious_rate_LA.2018", "cfs_nonser_rate_LA.2018"),
+                       c(12, 3),
+                       trial_name)
+
+
+analysis_df <- replicate_cols(data_num, weights, repdist, trial_name)
+
+# We consider numbers of clusters from 2 to 20
+start_n <- 2
+end_n <- 20
+n_vals <- c(start_n:end_n)
+```
+
+### K-Means
+```{r}
+set.seed(213)
+
+results <- k_means_cluster(analysis_df, start_n, end_n, trial_name)
+
+within_ss_plot <- elbow_plot(n_vals, results$within_ss) +
+  labs(title = "Within Sum of Squares") +
+  ggsave(here("images", paste(trial_name, "wss_kmeans.png", sep = "_")), width = 5, height = 3, units = "in")
+
+avg_silhouette_plot <- silhouette_plot(n_vals, results$avg_silhouette) +
+  labs(title = "Average Silhouette") +
+  ggsave(here("images", paste(trial_name, "sil_kmeans.png", sep = "_")) , width = 5, height = 3, units = "in")
+
+grid.arrange(within_ss_plot, avg_silhouette_plot, ncol = 2)
+```
+
+
+### Hierarchical 
+```{r}
+
+results <- hierarchical_cluster(analysis_df, start_n, end_n, trial_name)
+
+within_ss_plot <- elbow_plot(n_vals, results$within_ss) +
+  labs(title = "Within Sum of Squares") +
+  ggsave(here("images", paste(trial_name, "wss_hclust.png", sep = "_")), width = 5, height = 3, units = "in")
+
+avg_silhouette_plot <- silhouette_plot(n_vals, results$avg_silhouette) +
+  labs(title = "Average Silhouette") +
+  ggsave(here("images", paste(trial_name, "sil_hclust.png", sep = "_")) , width = 5, height = 3, units = "in")
+
+grid.arrange(within_ss_plot, avg_silhouette_plot, ncol=2)
+```
+
+### Gaussian Mixture Models
+```{r}
+results <- gmm_cluster(analysis_df, start_n, end_n, trial_name)
+
+gmm_bic_plot <- bic_plot(n_vals, results$bic) + 
+  labs(title = "Bayesian Information Criterion") +
+  ggsave(here("images", paste(trial_name, "bic_gmm.png", sep = "_")), width = 5, height = 3, units = "in")
+
+avg_silhouette_plot <- silhouette_plot(n_vals, results$avg_silhouette) + 
+  labs(title = "Average Silhouette") +
+  ggsave(here("images", paste(trial_name, "sil_gmm.png", sep = "_")), width = 5, height = 3, units = "in")
+
+grid.arrange(gmm_bic_plot, avg_silhouette_plot, ncol = 2)
+```
+
+Looking at the evaluation plots for each model above we seee that two metrics for each algorithm do not always point to the same number or clusters for each algorithm. While WSS and BIC improve as the number of clusters increases, the average silhouette score generally gets worse. Therefore, in evaluating the “optimal” number of clusters for each algorithm, we looked to identify the number that maximized quality across the two metrics while maintaining few enough clusters for interpretability and relevance to community-police conversations. In all cases, we identified 5 as the optimal number of clusters based on these criteria. We store our "best" model for each algorithm below:
+
+```{r}
+best_n_k <- 5
+best_n_h <- 5
+best_n_g <- 5
+
+k_best <- kmeans(analysis_df, best_n_k, nstart = 25)
+hc_best <- hcut(analysis_df, 
+                hc_func = "hclust",
+                hc_method = "ward.D2",
+                hc_metric = "euclidean",
+                k = best_n_h)
+g_best <- Mclust(analysis_df, best_n_g, verbose = FALSE)
+```
+
+Define columns we"ll explore for results and save results dataframe with cluster assignment from each algorithm.
+```{r}
+additional_cols <- c("a_pop_pct.2018", "b_pop_pct.2018", "w_pop_pct.2018",
+                     "h_pop_pct.2018", "s_totnum.2018","arr_total.2018", 
+                     "cfs_ui.2018", "cfs_serious.2018", "cfs_nonser.2018", 
+                     "crime_p1v.2018", "crime_p1p.2018", "crime_p2.2018",
+                     "s_numveh.2018", "s_numped.2018", "juv_pop_pct.2018", 
+                     "arr_total.2018", "total_pop.2018")
+
+results_cols <- c(analysis_cols, additional_cols)
+```
+
+
+Create results dataframe with cluster assignments for best k-means, hierarchical, and GMM model.
+```{r}
+data_cols <- data %>% select(additional_cols)
+
+results_df <- cbind(repdist, analysis_df, data_cols) %>% 
+  mutate(cluster_h = as.factor(hc_best$cluster),
+         cluster_k = as.factor(k_best$cluster),
+         cluster_g = as.factor(g_best$classification),
+         total_police_scale = scale(s_totnum.2018 + arr_total.2018),
+         total_citizen_scale = scale(cfs_ui.2018)) %>%
+  rename(REPDIST = repdist)
+
+
+write.csv(results_df, file = here("results", paste(trial_name, "_results.csv", sep = "")), row.names = FALSE) 
+```
+
+Read saved results csv for analysis and convert cluster assignments to factor for analysis.
+```{r}
+results_df <- read.csv(here("results",
+                            paste(trial_name, "results.csv", sep = "_"))) %>%
+  mutate(cluster_h = as.factor(cluster_h)) %>%
+  mutate(cluster_g = as.factor(cluster_g)) %>%
+  mutate(cluster_k = as.factor(cluster_k)) 
+
+```
+
+Look at summary statistics by cluster for each algorithm 
+```{r}
+results_cluster_k <- results_df %>%
+  select(cluster_k, results_cols) %>%
+  group_by(cluster_k) %>%
+  summarise_all(mean, na.rm = TRUE)
+
+results_cluster_h <- results_df %>%
+  select(cluster_h, results_cols) %>%
+  group_by(cluster_h) %>%
+  summarise_all(mean, na.rm = TRUE)
+
+results_cluster_g <- results_df %>%
+  select(cluster_g, results_cols) %>%
+  group_by(cluster_g) %>%
+  summarise_all(mean, na.rm = TRUE)
+  
+```
+
+```{r}
+table(results_df$cluster_k)
+```
+
+```{r}
+results_ck <- column_to_rownames(results_cluster_k, "cluster_k")
+round(t(results_ck), 3) 
+```
+
+```{r}
+table(results_df$cluster_h)
+```
+
+
+```{r}
+results_ch <- column_to_rownames(results_cluster_h, "cluster_h")
+round(t(results_ch), 3) 
+```
+
+```{r}
+table(results_df$cluster_g)
+```
+
+
+```{r}
+results_cg <- column_to_rownames(results_cluster_g, "cluster_g")
+round(t(results_cg), 3) 
+```
+
+## Cluster plots
+
+To select our final model from the best k-means, hierarchical, and GMM models, we review the summary statistics and evenness of the  cluster assignments above. We see that the reporting districts are more evenly distributed across the five clusters in GMM than in k-means and hierarchical. Looking at the cluster scatterplots below, we can identify that the unevenness for k-means and hierarchical likely is driven by the greater sensitivity of those two algorithms to outliers.
+
+```{r}
+make_cluster_scatterplot(results_df, "cluster_k", trial_name = trial_name)
+```
+
+```{r}
+make_cluster_scatterplot(results_df, "cluster_h", trial_name = trial_name)
+```
+
+## Figure 3: Final cluster scatterplot
+
+```{r}
+make_cluster_scatterplot(results_df, "cluster_g", trial_name = trial_name)
+```
+
+We see that GMM much better accommodates outliers and provides a better fit to the distribution of our data. Based on this analysis, we identify GMM with 5 clusters as our final model for analysis. 
+
+```{r}
+final_cluster <- "cluster_g"
+final_n <- 5
+
+# set cluster factor varaiable levels in increasing order by serious calls for service for clarity of plots
+lvl <- arrange(results_cluster_g, cfs_serious_rate_LA.2018)[["cluster_g"]]
+lvl_k <- arrange(results_cluster_k, cfs_serious_rate_LA.2018)[["cluster_k"]]
+lvl_h <- arrange(results_cluster_h, cfs_serious_rate_LA.2018)[["cluster_h"]]
+
+results_df <- results_df %>%
+  mutate(cluster_g = factor(cluster_g,
+                            levels = lvl,
+                            labels = c("1", "2", "3", "4", "5")),
+         cluster_k = factor(cluster_k,
+                            levels = lvl_k,
+                            labels = c("1", "2", "3", "4", "5")),
+         cluster_h = factor(cluster_h,
+                            levels = lvl_h,
+                            labels = c("1", "2", "3", "4", "5")))
+
+```
+
+Final cluster scatterplots for technical appendix. 
+```{r}
+
+cluster_plot_g <- make_cluster_scatterplot(results_df, "cluster_g", trial_name = trial_name) +
+  labs(subtitle = "",
+       title = "Gaussian Mixture Models") +
+  theme(axis.title.x=element_blank(),
+        axis.title.y=element_blank())
+  
+cluster_plot_h <- make_cluster_scatterplot(results_df, "cluster_h", trial_name = trial_name) +
+  labs(subtitle = "",
+       title = "Hierarchical") +
+  theme(axis.title.x=element_blank(),
+        axis.title.y=element_blank())
+  
+cluster_plot_k <- make_cluster_scatterplot(results_df, "cluster_k", trial_name = trial_name) +
+  labs(title = "K-means",
+       subtitle = "") +
+  theme(axis.title.x=element_blank(),
+        axis.title.y=element_blank())
+  
+
+arr <- grid.arrange(cluster_plot_k, cluster_plot_h, cluster_plot_g, ncol = 1,
+             bottom = textGrob("Police-Initiated Activity: Stop and Arrest Rate (Standard Deviations from Mean)",
+                               gp = gpar(fontsize = 8.5,
+                                    fontfamily = "Lato",
+                                    fontface = "italic")),
+             left = textGrob("Resident-Initiated Activity: Calls for Service Rate (Standard Deviations from Mean)",
+                             rot = 90, 
+                             gp = gpar(fontsize = 8.5,
+                                  fontfamily = "Lato",
+                                  fontface = "italic"))) 
+
+ggsave(here("images", paste(trial_name, "cluster_scatter_appendix.png", sep = "_")), 
+           width = 7,
+           height = 10,
+           units = "in", arr)
+
+```
+
+
+
+# Analysis of Results
+
+```{r}
+# create dataframe with raw columns and cluster assignments for plotting
+raw_results_df <- read.csv(here("data", paste(trial_name, "data_clean.csv", sep = "_"))) %>%
+  mutate(total_police = s_totnum.2018 + arr_total.2018) %>%
+  rename(REPDIST = repdist)
+
+raw_results_df <- cbind(raw_results_df, results_df[final_cluster])
+```
+
+## Table 1, Table A.1 cluster averages
+
+```{r}
+raw_results_cluster_g <- raw_results_df %>%
+  group_by(cluster_g) %>%
+  summarise_all(mean) %>%
+  select(c("cfs_ui.2018", "cfs_serious.2018", "cfs_nonser.2018", 
+           "crime_p1v.2018", "crime_p1p.2018", "crime_p2.2018",
+           "s_numveh.2018", "s_numped.2018", "juv_pop_pct.2018", 
+           "arr_total.2018", "total_pop.2018"))
+
+data.frame(round(t(raw_results_cluster_g), 3)) %>%
+  mutate(variable = colnames(raw_results_cluster_g)) %>%
+  write.csv(here("results", 
+                 paste(trial_name, "g-raw.csv", sep = "_")))
+```
+
+
+## T-Test Table - Scaled Variables for Clustering
+
+```{r}
+
+p_values <- t_test_cluster(results_df,
+                           final_cluster,
+                           results_cols)
+
+write.csv(p_values,
+          file = here("results", paste(trial_name, "t-test.csv", sep = "_" )))
+
+```
+
+## T-Test Table - Raw Variables 
+
+```{r}
+raw_cols <- c("arr_total_a.2018", "arr_total_b.2018", "arr_total_h.2018",
+              "arr_total_w.2018", "s_numall_h.2018", "s_numall_b.2018",
+              "s_numall_w.2018", "s_numall_a.2018", "a_pop_pct.2018",
+              "b_pop_pct.2018", "w_pop_pct.2018", "h_pop_pct.2018",
+              "s_totnum.2018","arr_total.2018", "cfs_ui.2018",
+              "cfs_serious.2018", "cfs_nonser.2018", "crime_p1v.2018",
+              "crime_p1p.2018", "crime_p2.2018", "ei_below_200pov.2018",
+              "ei_laborforce_unemployed.2018",
+              "immigrant_citizen_pop_count.2018",
+              "immigrant_noncitizen_pop_count.2018", "e_college_count.2018",
+              "e_lhs.2018", "hre_renter_hh.2018", "hre_limited_eng_hh.2018",
+              "hre_rent.2018")
+
+p_values <- t_test_cluster(raw_results_df, final_cluster, raw_cols)
+write.csv(p_values,
+          file = here("results",
+                      paste(trial_name, "t-test-raw.csv", sep = "_" )))
+```
+
+## Figure 1: Cluster Map
+
+```{r}
+set_urbn_defaults(style = "map")
+
+# read in reporting district shapefile 
+rd <- st_read("https://opendata.arcgis.com/datasets/4398360b1a0242b78904f46b3786ae73_0.geojson",
+              stringsAsFactors = FALSE, quiet = TRUE) 
+
+rd_results <- inner_join(rd, results_df, by = "REPDIST")
+
+cluster_map <- ggplot() +
+  geom_sf(data = rd_results, mapping = aes(fill = cluster_g)) +
+  labs(title = "Reporting Districts by Group", fill = "Group") +
+  ggsave(here("images", paste(trial_name, "cluster_map.png", sep = "_")))
+
+
+cluster_map
+```
+
+
+## Figure 2: CFS, Stops, Arrests, Crime by Cluster - Total and Per Capita
+
+```{r, fig.width = 5, fig.height=5}
+
+make_per_capita_barplot(vars = c("cfs_ui.2018", "s_totnum.2018",
+                                 "arr_total.2018", "crime_total.2018"),
+                        denom_var = "total_pop.2018",
+                        lbls = c("Calls for Service", "Stops",
+                                 "Arrests", "Crime"),
+                        file_name = "activity_per_capita.png",
+                        trial_name = trial_name,
+                        x_lab = "Activity Type",
+                        y_lab = "Incidents of Activity Per 1,000 Group Residents",
+                        title = "Calls, Stops, Arrests, and Crimes per 1,000 Group Residents",
+                        mult_factor = 1000)
+
+```
+
+## Figure 4: Severity by Cluster
+
+```{r}
+severe_plot <- raw_results_df %>%
+  select(crime_p1v.2018, crime_total.2018, s_numped.2018,
+         s_totnum.2018,cfs_serious.2018, cfs_ui.2018, cluster_g) %>%
+  group_by(cluster_g) %>%
+  summarise_all(sum) %>%
+  mutate(p1v_pct_crime = (crime_p1v.2018 / crime_total.2018)* 100,
+         serious_pct_cfs = (cfs_serious.2018 / cfs_ui.2018) * 100,
+         ped_pct_stop = (s_numped.2018 / s_totnum.2018) * 100) %>%
+  select(cluster_g, p1v_pct_crime, serious_pct_cfs,
+         ped_pct_stop) %>%
+  gather(key = variable, value = value, -cluster_g) %>% 
+  mutate(variable = factor(variable,
+                           levels = c("p1v_pct_crime", 
+                                      "serious_pct_cfs", "ped_pct_stop"),
+                           labels = c("% Crime Violent",
+                                      "% Calls Serious", 
+                                      "% Stops Pedestrian"))) %>%
+  ggplot(aes(fill = cluster_g, y = value, x = variable)) +
+  geom_bar(position ="dodge", stat ="identity") +
+  coord_flip() +
+  labs(x = "Percent Severe Activity by Group",
+       y = "Percent of Severe Activity in Group (Total Severe Activity/Total Activity in Group)",
+       title = "Group Five Has Greatest Percent Severe Activity Across Types",
+       fill = "Cluster") +
+  ggsave(here("images", 
+              paste(trial_name, "severity.png", sep = "_")), 
+         width = 6, height = 4.5, units = "in")
+
+severe_plot
+
+```
+
+```{r}
+# percent serious by group 
+
+raw_results_df %>%
+  select(cfs_serious.2018, cfs_ui.2018, cluster_g) %>%
+  group_by(cluster_g) %>%
+  summarise_all(sum) %>%
+  mutate(serious_pct_cfs = (cfs_serious.2018 / cfs_ui.2018) * 100)
+
+```
+
+```{r}
+severe_plot_blog <- raw_results_df %>%
+  select(crime_p1v.2018, crime_total.2018, s_numped.2018,
+         s_totnum.2018,cfs_serious.2018, cfs_ui.2018, cluster_g) %>%
+  group_by(cluster_g) %>%
+  summarise_all(sum) %>%
+  mutate(p1v_pct_crime = (crime_p1v.2018 / crime_total.2018)* 100,
+         serious_pct_cfs = (cfs_serious.2018 / cfs_ui.2018) * 100) %>%
+  select(cluster_g, p1v_pct_crime, serious_pct_cfs) %>%
+  gather(key = variable, value = value, -cluster_g) %>% 
+  mutate(variable = factor(variable,
+                           levels = c("p1v_pct_crime", 
+                                      "serious_pct_cfs"),
+                           labels = c("% Crime Violent",
+                                      "% Calls Serious")),
+         cluster_g = factor(cluster_g,
+                            levels = c(1, 2, 3, 4, 5),
+                            labels = c("Lowest Activity", "Low Activity", "Medium Activity", "High Activity", "Highest Activity"))) %>%
+  ggplot(aes(fill = cluster_g, y = value, x = variable)) +
+  geom_bar(position ="dodge", stat ="identity") +
+  coord_flip() +
+  labs(x = "Percent Severe Activity by Group",
+       y = "Percent of Severe Activity in Group (Total Severe Activity/Total Activity in Group)",
+       title = "Group Five Has Greatest Percent Serious Calls and Violent Crime",
+       fill = "Group") +
+  ggsave(here("images", 
+              paste(trial_name, "severity_blog.png", sep = "_")), 
+         width = 6.5, height = 4.5, units = "in")
+
+severe_plot_blog
+
+```
+
+## Figure 5: Stop rate by race by cluster
+
+```{r}
+make_mean_by_cluster_barplot(vars = c("stop_rate_b_LA.2018",
+                                      "stop_rate_w_LA.2018", 
+                                      "stop_rate_a_LA.2018",
+                                      "stop_rate_h_LA.2018"),
+                             lbls = c("Black Stop Rate",
+                                      "White Stop Rate",
+                                      "Asian Stop Rate",
+                                      "Hispanic Stop Rate"),
+                             file_name = "stop_rate_race.png", 
+                             trial_name = trial_name,
+                             x_lab = "Stop Rate by Race and Cluster",
+                             y_lab = "Average Stop Rate (Standard Deviations from Mean)",
+                             title = "Discrepancies in Stop Rate by Race Greatest\nin Highest-Contact Clusters"
+                            )
+
+stop_plot_per_capita_by_race <- raw_results_df %>%
+  select(s_numall_a.2018, s_numall_b.2018, s_numall_h.2018, s_numall_w.2018,
+         a_pop_count.2018, b_pop_count.2018, h_pop_count.2018,
+         w_pop_count.2018, cluster_g) %>%
+  group_by(cluster_g) %>%
+  summarise_all(sum) %>%
+  mutate(s_rate_b = s_numall_b.2018 / b_pop_count.2018,
+         s_rate_a = s_numall_a.2018 / a_pop_count.2018,
+         s_rate_h = s_numall_h.2018 / h_pop_count.2018,
+         s_rate_w = s_numall_w.2018 / w_pop_count.2018) %>%
+  select(cluster_g, s_rate_b, s_rate_a, s_rate_h, s_rate_w) %>%
+  gather(key = variable, value = value, -cluster_g) %>% 
+  mutate(variable = factor(variable,
+                           levels = c("s_rate_b", "s_rate_w",
+                                      "s_rate_a", "s_rate_h"),
+                           labels = c("Black Stop Rate", 
+                                      "White Stop Rate",
+                                      "Asian Stop Rate", 
+                                      "Hispanic Stop Rate"))) %>%
+  ggplot(aes(fill = cluster_g, y = value, x = variable)) +
+  geom_bar(position ="dodge", stat ="identity") +
+  coord_flip() +
+  labs(x = "Stop Rate by Race",
+       y = "Average Stop Rate",
+       title = "Black Stop Rate Highest Across All Groups",
+       fill = "Cluster") +
+  ggsave(here("images", 
+              paste(trial_name, "stop_rates_per_capita.png", sep = "_")), 
+         width = 6, height = 4.5, units = "in")
+
+stop_plot_per_capita_by_race
+```
+
+
+```{r}
+s_race <- raw_results_df %>%
+  select(s_numall_a.2018, s_numall_b.2018, s_numall_h.2018, s_numall_w.2018,
+         a_pop_count.2018, b_pop_count.2018, h_pop_count.2018,
+         w_pop_count.2018, cluster_g) %>%
+  group_by(cluster_g) %>%
+  summarise_all(sum) %>%
+  mutate(s_rate_b = s_numall_b.2018 / b_pop_count.2018,
+         s_rate_a = s_numall_a.2018 / a_pop_count.2018,
+         s_rate_h = s_numall_h.2018 / h_pop_count.2018,
+         s_rate_w = s_numall_w.2018 / w_pop_count.2018) %>%
+  select(cluster_g, s_rate_b, s_rate_a, s_rate_h, s_rate_w)
+
+s_race$s_rate_b[5] / s_race$s_rate_b[1]
+s_race$s_rate_w[5] / s_race$s_rate_w[1]
+```
+
+## Figure 6: Demographic grid
+
+```{r}
+
+pop_poverty <- make_per_capita_barplot(vars = c("ei_below_200pov.2018"),
+                        denom_var = "total_pop.2018",
+                        lbls = c(""),
+                        file_name = "pop_poverty.png",
+                        trial_name = trial_name,
+                        x_lab = "Group",
+                        y_lab = "% Population Below 200% Poverty Line",
+                        title = "",
+                        mult_factor = 100)
+
+hh_lim_eng <- make_per_capita_barplot(vars = c("hre_limited_eng_hh.2018"),
+                        denom_var = "hre_hh.2018",
+                        lbls = c(""),
+                        file_name = "hh_lim_eng.png",
+                        trial_name = trial_name,
+                        x_lab = "Group",
+                        y_lab = "% Households with Limited English",
+                        title = "",
+                        mult_factor = 100)
+
+hh_renter <- make_per_capita_barplot(vars = c("hre_renter_hh.2018"),
+                        denom_var = "hre_hh.2018",
+                        lbls = c(""),
+                        file_name = "hh_renter.png",
+                        trial_name = trial_name,
+                        x_lab = "Group",
+                        y_lab = "% Households Renting",
+                        title = "",
+                        mult_factor = 100)
+
+pop_immigrant_noncitizen <- make_per_capita_barplot(vars = c("immigrant_noncitizen_pop_count.2018"),
+                        denom_var = "total_pop.2018",
+                        lbls = c(""),
+                        file_name = "pop_poverty.png",
+                        trial_name = trial_name,
+                        x_lab = "Group",
+                        y_lab = "% Population Non-Citizen Immigrants",
+                        title = "",
+                        mult_factor = 100)
+
+
+g <- arrangeGrob(pop_poverty, pop_immigrant_noncitizen, hh_lim_eng, hh_renter, 
+             nrow = 2) 
+ggsave(file = here("images", paste(trial_name, "demographic_grid.png", sep = "_")), g)
+
+```
+
+## Figure 7: Built Environment Grid
+
+Pre-processing of USPS data. Crosswalk tract-level USPS data to reporting districts.
+```{r}
+# import crosswalk between reporting districts and tracts - created using ArcGIS following methodology described in  technical appendix
+xwalk <- read.csv(here("data", "rd_tract_xwalk.csv"), 
+                  colClasses = c("GEOID" = "character")) 
+
+# import usps address data, contains count of business, residential, and other address by tract 
+usps <- fread(here("data", "usps_data.csv.gz"))
+
+# filter usps by LA and all quarters in 2018, calculate average addresses across quarters in 2018
+usps_LA <- usps %>%
+             filter(grepl("2018", qy)) %>%
+             mutate(GEOID = as.character(GEOID)) %>%
+             group_by(GEOID) %>%
+             summarise(
+               AMS_BUS = mean(AMS_BUS, na.rm = TRUE),
+               AMS_RES = mean(AMS_RES, na.rm = TRUE),
+               AMS_OTH = mean(AMS_OTH, na.rm = TRUE))
+
+usps_LA <- left_join(xwalk, usps_LA, by = "GEOID")
+
+#create weighted sums for reporting districts
+
+usps_LA_wt <- usps_LA %>% 
+  mutate(BUS_WT = count_weight * AMS_BUS,
+         RES_WT = count_weight * AMS_RES,
+         ALL_WT = count_weight * (AMS_BUS + AMS_OTH + AMS_RES)) %>%
+  select(REPDIST, RES_WT, BUS_WT, ALL_WT) %>%
+  group_by(REPDIST) %>%
+  summarise(RES_ADDR = sum(RES_WT),
+            BUS_ADDR = sum(BUS_WT),
+            ALL_ADDR = sum(ALL_WT))
+
+usps_LA_wt <- usps_LA_wt %>% mutate(BUS_ADDR_PCT = BUS_ADDR / ALL_ADDR)
+write.csv(usps_LA_wt, here("data", paste(trial_name, "usps_la_wt.csv", sep = "_")), row.names = FALSE)
+```
+
+Join USPS data to results dataframes
+
+```{r}
+results_df <- left_join(results_df, usps_LA_wt, by = "REPDIST")
+raw_results_df <- left_join(raw_results_df, usps_LA_wt, by = "REPDIST")
+```
+
+### Average address density by cluster (Table A.1)
+
+```{r}
+rd_results_usps <- inner_join(rd, raw_results_df, by = "REPDIST") %>%
+  mutate(bus_quant = cut(BUS_ADDR_PCT, 
+                         quantile(BUS_ADDR_PCT, 
+                                  probs = 0:5 / 5, 
+                                  na.rm = TRUE), 
+                         include.lowest = TRUE))
+
+rd_results_usps <- rd_results_usps %>% 
+  mutate(area = st_area(st_transform(geometry, 6423)), #https://epsg.io/6423 , units = meter
+         res_addr_density = (RES_ADDR /area) * (2.59e+6),
+         addr_density = (ALL_ADDR / area) * (2.59e+6), #convert to addresses per square mile
+         bus_density = (BUS_ADDR/area)  * (2.59e+6),
+         pop_density = (total_pop.2018/area)  * (2.59e+6)
+         ) 
+
+built_env <- as.data.frame(rd_results_usps) %>% 
+  group_by(cluster_g) %>%
+  summarise(avg_addr_density = as.numeric(mean(addr_density, na.rm = TRUE)),
+            avg_res_density = as.numeric(mean(res_addr_density, na.rm = TRUE)),
+            avg_bus_density = as.numeric(mean(bus_density, na.rm = TRUE)),
+            avg_pop_density = as.numeric(mean(pop_density, na.rm = TRUE))
+            ) 
+
+built_env
+
+built_env %>%
+  rename(final_cluster = cluster_g) %>%
+  select(-avg_res_density) %>%
+  write.csv(here("results", paste(trial_name, "density_by_cluster.csv")), row.names = FALSE)
+```
+
+Average RD area in square miles
+
+```{r}
+mean(rd_results_usps$area) / (2.59e+6)
+```
+
+Create built environment plot. 
+
+```{r}
+
+addr_density <- ggplot(built_env, aes(fill = cluster_g, y = avg_addr_density, x = cluster_g)) +
+                geom_bar(position = "dodge", stat = "identity") +
+                coord_flip() +
+                labs(x = "Group", 
+                     y = "Average Address Density",
+                     fill = "Cluster") +
+                ggsave(here("images", 
+                            paste(trial_name, "avg_addr_density.png", sep = "_")), 
+                       width = 6, height = 4.5, units = "in")
+
+bus_density <- ggplot(built_env, aes(fill = cluster_g, y = avg_bus_density, x = cluster_g)) +
+                geom_bar(position = "dodge", stat = "identity") +
+                coord_flip() +
+                labs(x = "Group", 
+                     y = "Average Business Address Density",
+                     fill = "Cluster") +
+                ggsave(here("images", 
+                            paste(trial_name, "avg_bus_addr_density.png", sep = "_")), 
+                       width = 6, height = 4.5, units = "in")
+
+pop_density <- ggplot(built_env, aes(fill = cluster_g, y = avg_pop_density, x = cluster_g)) +
+                 geom_bar(position = "dodge", stat = "identity") +
+                coord_flip() +
+                labs(x = "Group", 
+                     y = "Average Population Density",
+                     fill = "Cluster") +
+                ggsave(here("images", 
+                            paste(trial_name, "avg_addr_density.png", sep = "_")), 
+                       width = 6, height = 4.5, units = "in")
+
+
+g <- arrangeGrob(addr_density, bus_density, pop_density, 
+             nrow = 1) 
+ggsave(file = here("images", paste(trial_name, "density_grid.png", sep = "_")), g)
+
+```
+
+## Table 2: Resident- and Police-Initiated Contact Ratio
+
+```{r}
+raw_results_df %>% 
+  select(cluster_g, cfs_ui.2018, s_totnum.2018,
+         arr_total.2018, crime_total.2018) %>%
+  group_by(cluster_g) %>% 
+  summarise_all(sum) %>% 
+  mutate(stop_arr_ratio.2018  = s_totnum.2018 / arr_total.2018,
+         citizen_police_ratio.2018 = cfs_ui.2018 / 
+           (arr_total.2018 + s_totnum.2018)) %>%
+  select(cluster_g, stop_arr_ratio.2018, citizen_police_ratio.2018) %>% 
+  as_tibble()
+
+```
+
+
+## Table 3: Population of Each Cluster - Total and by Race (Also in Table A.1)
+
+```{r}
+raw_results_df %>% 
+  select(cluster_g, total_pop.2018, b_pop_count.2018, a_pop_count.2018,
+         h_pop_count.2018, w_pop_count.2018) %>% 
+  group_by(cluster_g) %>% 
+  summarise_all(sum) %>%
+  mutate(pct_asian = a_pop_count.2018 / total_pop.2018,
+         pct_black = b_pop_count.2018 / total_pop.2018,
+         pct_hispanic = h_pop_count.2018 / total_pop.2018,
+         pct_white = w_pop_count.2018 / total_pop.2018) %>%
+  select(cluster_g, total_pop.2018, pct_asian, pct_black, pct_hispanic, pct_white)
+  
+```
+
+
+## Outliers in resident/police interaction
+
+```{r}
+raw_results_df <- raw_results_df %>%
+  mutate(total_police_scale = scale(total_police)) %>%
+  mutate(total_citizen_scale = scale(cfs_ui.2018)) %>%
+  mutate(pol_cit_diff = total_citizen_scale - total_police_scale)
+
+results_45 <- raw_results_df %>%
+  filter(cluster_g == 4 | cluster_g == 5)
+
+pol_cit_diff_45_mean = mean(results_45[["pol_cit_diff"]], na.rm = TRUE)
+pol_cit_diff_45_sd = sd(results_45[["pol_cit_diff"]], na.rm = TRUE)
+
+results_45 <- results_45 %>% 
+  mutate(outlier_pos = ifelse(pol_cit_diff > 
+                                pol_cit_diff_45_mean + pol_cit_diff_45_sd, 1, 0),
+         outlier_neg = ifelse(pol_cit_diff < 
+                                pol_cit_diff_45_mean - pol_cit_diff_45_sd, 1, 0),
+         outlier = "No Outlier") %>% 
+  mutate(outlier = ifelse(outlier_pos == 1, "More Resident-Initiated Contact", outlier)) %>% 
+  mutate(outlier = ifelse(outlier_neg == 1, "More Police-Initiated Contact", outlier)) %>% 
+  mutate(outlier = as.factor(outlier))  
+
+table(results_45$outlier)
+```
+
+Two-way t-tests of positive outliers against cluster 4 and 5 population 
+```{r}
+t_cols <- c(raw_cols, "BUS_ADDR_PCT")
+t_test_outlier(results_45, t_cols, "outlier_pos")
+```
+
+Two-way t-tests of nagative outliers against cluster 4 and 5 population
+
+```{r}
+t_test_outlier(results_45, t_cols, "outlier_neg")
+```
+
+
+#### Outlier Map
+
+```{r}
+rd_results_45 <- inner_join(rd, results_45, by = "REPDIST")
+
+set_urbn_defaults(style = "map")
+
+outlier_map <- ggplot() +
+  geom_sf(data = rd_results_45, mapping = aes(fill = outlier)) +
+  labs(title = "Reporting Districts in Groups 4 and 5 by Outlier Status", fill = "Outlier Status") +
+  ggsave(here("images", paste(trial_name, "outlier_map.png", sep = "_")))
+
+outlier_map
+
+
+```
+
+## Figure A1: Cluster map with neighborhoods
+
+```{r}
+ngh_LAC <- st_read(here("data/LA Times Neighborhood Shapefiles", "LAC_Neigh.shp"), stringsAsFactors = FALSE, quiet = TRUE)
+st_crs(ngh_LAC) <- 4326
+
+int <- st_intersection(ngh_LAC, rd)
+int$areaRD <- as.numeric(st_area(int$geometry))
+rd_by_ngh <- int %>% 
+  group_by(name) %>%
+  summarise(TotalRd = sum(areaRD)) %>% select(name, TotalRd)
+
+st_geometry(rd_by_ngh) <- NULL
+
+ngh_rd <- left_join(ngh_LAC, rd_by_ngh, by = "name") %>%
+  mutate(areaRD = replace_na(TotalRd, 0)) %>%
+  mutate(ngh_area = as.numeric(st_area(geometry))) %>%
+  mutate(pct_rd = as.numeric(TotalRd/ngh_area)) %>%
+  mutate(pct_rd = replace_na(pct_rd, 0))
+
+ngh_rd_50 <- ngh_rd %>% filter(pct_rd > .5) %>% 
+  mutate(name_label = ifelse(areaRD > 14291039, name, NA)) %>%
+  mutate(name_label = str_replace(name_label, " ", "\n"))
+
+set_urbn_defaults(style = "map")
+
+cluster_map_ngh <- ggplot() +
+  geom_sf(data = rd_results, mapping = aes(fill = cluster_g), lwd = 0, alpha = 0.3) +
+  geom_sf(data = ngh_rd_50, fill = "transparent", color = "black", size = 1) +
+  labs(title = "Reporting Districts by Cluster and Neighborhood", fill = "Cluster") +
+   geom_sf_label(data = ngh_rd_50, 
+                 expand = TRUE,
+                      aes(label = name_label), 
+                      size = 2, 
+                      label.padding = unit(0.1, "lines"),
+                 lineheight=0.6) +
+  ggsave(here("images", paste(trial_name, "cluster_map_ngh.png", sep = "_")), width = 7, heigh = 10, unit = "in")
+
+
+cluster_map_ngh
+```
+
+
+# Stability analysis
+
+```{r}
+# conduct stability analysis to identify variables driving cluster assignment
+# variables with fewest common cluster assignments when omitted from cluster modeling are most driving clustering
+
+stability <- stability_analysis(analysis_cols,
+                                analysis_df,
+                                final_n,
+                                results_df$cluster_g,
+                                trial_name)
+
+stability
+```
