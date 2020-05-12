@@ -16,7 +16,8 @@ This analysis was conducted in RStudio using R v 3.6.1.
 
 We use the following data sources for this project:
 
-LAPD open data on crime, arrests, calls, and stops:
+LAPD open data on reporting districts, crime, arrests, calls, and stops:
+- [Reporting District Boundaries](https://geohub.lacity.org/datasets/lapd-reporting-districts)
 - [Crime: 2010-2019](https://data.lacity.org/A-Safe-City/Crime-Data-from-2010-to-2019/63jg-8b9z)
 - [Arrests: 2010-Present](https://data.lacity.org/A-Safe-City/Arrest-Data-from-2010-to-Present/yru6-6re4)
 - [Calls for Service: 2018](https://data.lacity.org/A-Safe-City/LAPD-Calls-for-Service-2018/nayp-w2tw)
@@ -28,13 +29,15 @@ American Community Survey data on neighborhood demographics:
 HUD USPS data on residential and business addresses:
 - [HUD USPS vacancy data](https://www.huduser.gov/portal/datasets/usps.html)
 
-All of the raw source data files that the authors used to create the analytical data set are included in the `data/` directory, with the exception of the HUD USPS data which is restricted access and must be downloaded from the HUD website at the link above. We include these static datasets to enable replication as the LAPD open data sources are frequently updated on the [LA Open Data Portal](https://data.lacity.org/). We observed that these updates can alter historical data so pulling the data on different dates has yielded different 2018 totals. The static dataset file names are:
-- Crime: `data/Crime_Data_from_2010_to_Present.csv`
-- Arrests: `data/Arrest_Data_from_2010_to_Present.csv`
-- Calls for Service: `data/CFS/LAPD_Calls_for_Service_2018.csv`
-- Stops: `data/Vehicle_and_Pedestrian_Stop_data_2010_to_Present.csv`
-- ACS:  This ACS file represents the reporting district-level demographic variables created by cross-walking the census tract-level raw ACS data to reporting districts based on the methodology described in the technical appendix using ArcGIS. The output file with the tract-to-reporting district weights can be found in `data/rd_tract_xwalk.csv`.
-- Reporting District Information: `data/LAPD_Reporting_Districts.csv`
+All of the raw source data files that the authors used to create the analytical data set are available from the authors by [request](astern@urban.org), with the exception of the HUD USPS data which is restricted access and must be downloaded from the HUD website at the link above. Requesting the static datasets will enable replication of our exact results as the LAPD open data sources are frequently updated on the [LA Open Data Portal](https://data.lacity.org/). We observed that these updates can alter historical data so pulling the data on different dates has yielded different 2018 totals. The `data/` repository includes the following files:
+- Analytical data set: `data/analysis_ready_by_district_final.csv`
+- Tract crosswalk: `data/rd_tract_xwalk.csv` 
+    - This file includes the tract-to-reporting district weights produced by crosswalking of the 2010 Census Tracts and the LAPD Reporting Districts using ArcGIS based on the methodology described in the technical appendix. 
+- Reporting District Exclusions: `data/Repdist_exculsions.csv`
+    - Includes a dummy variable indicating whether each reporting district is a LAPD reporting district. 
+- LA Times Neighborhood Shapefiles: `data/LA Times Neighborhood Shapefiles/LAC_Neigh.shp`
+    - Neighborhood boundaries in Los Angeles from LA Times. 
+
 If you want to replicate this analysis with the most up-to-date LAPD data, you can access the data via the LA Open Data Portal API at the source links given above.
 
 ## Getting Started
@@ -64,13 +67,17 @@ To run the analysis, perform the following steps:
 Under the current agreement with the USPS, HUD can only grant access to the vacancy data to governmental and non-profit organizations. In order to be granted access as a user, a requestor must be verified as a member of a non-profit or governmental organization.
 ```
 3. Open the R project `la-policing-typology.Rproj` in RStudio. 
-4. Open the `etl/01_lapd-data-processing.R` file in RStudio and run the file to create the analytical dataset `analysis_ready_by_district_final.csv`. 
-5. Open the `analysis/02_final-cluster-analysis.Rmd` file in RStudio and knit to html. When kniting, the code will check whether the necessary packages are installed and install any packages that are not already installed. Results tables will be written to the `results/` directory and plots will be written to the `images/` directory. Note that `analysis/02_final-cluster-analysis.Rmd` uses a global `trial_name` variable to enable the researchers to test multiple different models, each defined by a separate `trial_name` during the analysis process. This variable is set to `final` by default. All outputs in the `results/` and `images/` directory will use the `trial_name` as a prefix.
+4. Open the `analysis/02_final-cluster-analysis.Rmd` file in RStudio and knit to html. When kniting, the code will check whether the necessary packages are installed and install any packages that are not already installed. This file reads in the analytical data set `data/analysis_ready_by_district_final.csv` that is produced by running `etl/01_lapd-data-processing.R` and conducts the cluster analysis. Results tables will be written to the `results/` directory and plots will be written to the `images/` directory. Note that `analysis/02_final-cluster-analysis.Rmd` uses a global `trial_name` variable to enable the researchers to test multiple different models, each defined by a separate `trial_name` during the analysis process. This variable is set to `final` by default. All outputs in the `results/` and `images/` directory will use the `trial_name` as a prefix.
 
-The `etl/` director contains the key file (`01_lapd-data-processing.R`) used for preprocessing the raw data sources to create to create the analytical data set.
+If you want to replicate the production of the analytical data set, you will need to complete the following additional steps:
+1. Request the raw static data files for reporting districts, American Community Survey, crimes, arrests, stops, and calls for service from the authors or download the data files from data sources linked above. Place all files in the `data/` directory.
+2. Open the R project `la-policing-typology.Rproj` in RStudio. 
+3. Open the `etl/01_lapd-data-processing.R` file in RStudio and run the file to create the analytical dataset `data/analysis_ready_by_district_final.csv`. **Note that this file will not sucessfully run if you have not completed step 1.** 
+
+The `etl/` directory contains the key file (`01_lapd-data-processing.R`) used for preprocessing the raw data sources to create to create the analytical data set.
 
 The `analysis/` directory contains the key files used for analysis which are:
-- `02_final-cluster-analysis.Rmd`: file containing data pre-processing, cluster analysis, and analysis of results.
+- `02_final-cluster-analysis.Rmd`: file containing data pre-processing, cluster analysis, and analysis of cluster results.
 - `cluster-functions.R`: file containing functions for cluster analysis including variable weighting, cluster modeling, and stability analysis.
 - `data_viz_functions.R`: file containing functions for data visualization of cluster analysis results.
 
